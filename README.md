@@ -151,4 +151,4 @@ The simulation code is fully reproducible from the scripts in this repository. T
 
 ## Repository visibility
 
-This repository is private at the time of manuscript preparation. For peer review, either provide reviewers access to the private repository or submit a code archive generated from this repository. The repository can be made public after final review if desired.
+This repository is public to support peer review and reproducibility. The empirical raw data remain restricted as described above.

@@ -146,6 +146,17 @@ def _cluster_robust_glm_cov(model, exog, endog, weights, groups):
         cov *= len(uniq) / (len(uniq) - 1)
     return cov
 
+def _cluster_omega(G, groups, ridge=1e-8):
+    """Cluster-robust moment covariance for the step-2 weight matrix and J."""
+    G = np.asarray(G, dtype=float)
+    groups = np.asarray(groups)
+    uniq, inv = np.unique(groups, return_inverse=True)
+    sums = np.zeros((len(uniq), G.shape[1]), dtype=float)
+    np.add.at(sums, inv, G)
+    Omega = (sums.T @ sums) / G.shape[0]
+    return Omega + ridge * np.eye(G.shape[1])
+
+
 def _cluster_gmm_cov(moment_matrix, beta_hat, W_opt, groups):
     """Cluster-robust sandwich covariance for overidentified GMM."""
     D = _gmm_jacobian(moment_matrix, beta_hat)
@@ -452,7 +463,7 @@ def load_and_prepare(raw_path=RAW_PATH, save_path=INTERMEDIARY_PATH,
         df = df[df['drop_immediate_switcher'] == 0].copy()
 
     df['last_claim_date'] = pd.to_datetime(df['last_claim_date'], errors='coerce')
-    admin_end = pd.Timestamp('2025-12-01')
+    admin_end = pd.Timestamp('2026-02-01')
     df['last_month'] = df.groupby('id')['t'].transform('max')
     df['C_ltfu'] = (
         (df['t'] == df['last_month']) &
@@ -1035,9 +1046,10 @@ def run_snmm_g(df, grace_len=GRACE, trunc=TRUNC,
         return {'est_RD': np.nan, 'se_rd': np.nan, 'error': str(e)}
 
     G1 = moment_matrix(sol1.x)
-    Omega = (G1.T @ G1) / G1.shape[0]
+    post_groups = analysis.loc[post_grace, 'id'].to_numpy()
+    Omega = _cluster_omega(G1, post_groups)
     try:
-        W_opt = np.linalg.inv(Omega + 1e-8 * np.eye(q))
+        W_opt = np.linalg.inv(Omega)
     except np.linalg.LinAlgError:
         W_opt = np.linalg.pinv(Omega)
 
@@ -1066,10 +1078,10 @@ def run_snmm_g(df, grace_len=GRACE, trunc=TRUNC,
         )
 
     G_final = moment_matrix(beta_hat)
-    post_groups = analysis.loc[post_grace, 'id'].to_numpy()
     n_obs = len(np.unique(post_groups))
+    n_rows_pg = G_final.shape[0]
     g_bar = G_final.mean(axis=0)
-    J_stat = n_obs * float(g_bar @ W_opt @ g_bar)
+    J_stat = n_rows_pg * float(g_bar @ W_opt @ g_bar)
     J_df = q - p
     J_pval = 1 - chi2.cdf(J_stat, J_df) if J_df > 0 else np.nan
 
@@ -1187,6 +1199,144 @@ def run_snmm_g(df, grace_len=GRACE, trunc=TRUNC,
     }
 
 
+# Cluster bootstrap
+def _one_snmm_bootstrap(b_idx, df, knots_on, knots_wash, spline_type, seed,
+                        grace_len=GRACE, censor_col='C_ltfu'):
+    """Single bootstrap resample: redraw patients, re-fit SNMM with fixed knots."""
+    rng = np.random.default_rng(seed)
+    uniq_ids = df['id'].unique()
+    n = len(uniq_ids)
+    picked = rng.choice(uniq_ids, size=n, replace=True)
+
+    pieces = []
+    for new_id, src_id in enumerate(picked):
+        sub = df[df['id'] == src_id].copy()
+        sub['id'] = new_id
+        pieces.append(sub)
+    boot_df = pd.concat(pieces, ignore_index=True)
+
+    try:
+        res = run_snmm_g(
+            boot_df, grace_len=grace_len, censor_col=censor_col,
+            fixed_knots_on=knots_on,
+            fixed_knots_wash=knots_wash,
+            fixed_knots_never=None,
+            spline_type=spline_type,
+            verbose=False
+        )
+        if not np.isfinite(res.get('est_RD', np.nan)):
+            return {'b': b_idx, 'ok': False, 'err': res.get('error', 'NaN RD')}
+        return {
+            'b': b_idx,
+            'ok': True,
+            'est_RD': res['est_RD'],
+            'beta': np.asarray(res['beta']).tolist(),
+            'modeled_on': res['modeled_on'],
+            'modeled_wash': res['modeled_wash'],
+        }
+    except Exception as e:
+        return {'b': b_idx, 'ok': False, 'err': str(e)}
+
+
+def run_cluster_bootstrap(df, full_res, B=B_BOOT, seed=SEED, n_jobs=-1,
+                          grace_len=GRACE, censor_col='C_ltfu',
+                          checkpoint_path=None, verbose=True):
+    """Cluster bootstrap on patient id with knots fixed at full-data values."""
+    import pickle
+    from joblib import Parallel, delayed
+
+    t0 = time.time()
+    knots_on = full_res['knots_on']
+    knots_wash = full_res['knots_wash']
+    spline_type = full_res['spline_type']
+    max_on = len(full_res['modeled_on']) - 1
+    max_wash = len(full_res['modeled_wash']) - 1
+
+    rng_seeds = np.random.default_rng(seed).integers(0, 2**31 - 1, size=B)
+
+    results_by_b = {}
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        with open(checkpoint_path, 'rb') as f:
+            results_by_b = pickle.load(f)
+        if verbose:
+            print(f"  [BOOT] Loaded checkpoint with {len(results_by_b)} completed tasks", flush=True)
+
+    remaining = [b for b in range(B) if b not in results_by_b]
+    batch_size = max(n_jobs, 1) if n_jobs > 0 else 32
+    for start in range(0, len(remaining), batch_size):
+        batch = remaining[start:start + batch_size]
+        batch_results = Parallel(n_jobs=n_jobs, verbose=0)(
+            delayed(_one_snmm_bootstrap)(
+                b_idx=b, df=df,
+                knots_on=knots_on, knots_wash=knots_wash,
+                spline_type=spline_type, seed=int(rng_seeds[b]),
+                grace_len=grace_len, censor_col=censor_col
+            )
+            for b in batch
+        )
+        for r in batch_results:
+            results_by_b[r['b']] = r
+        if checkpoint_path:
+            with open(checkpoint_path, 'wb') as f:
+                pickle.dump(results_by_b, f)
+        if verbose:
+            print(f"  [BOOT] {len(results_by_b)}/{B} resamples done "
+                  f"({(time.time()-t0)/60:.1f} min)", flush=True)
+
+    results = [results_by_b[b] for b in range(B)]
+    ok_results = [r for r in results if r['ok']]
+    fail_results = [r for r in results if not r['ok']]
+    if verbose:
+        print(f"  [BOOT] {len(ok_results)}/{B} converged; {len(fail_results)} failures", flush=True)
+        if fail_results:
+            print(f"  [BOOT] first 3 failures: {fail_results[:3]}", flush=True)
+    if not ok_results:
+        raise RuntimeError("All bootstrap replications failed")
+
+    rds = np.array([r['est_RD'] for r in ok_results])
+    curves_on = np.array([r['modeled_on'] for r in ok_results])
+    curves_wash = np.array([r['modeled_wash'] for r in ok_results])
+
+    curve_rows = []
+    for comp, curves, point, alo, ahi, max_d in [
+        ('ON', curves_on, full_res['modeled_on'],
+         full_res['modeled_on_lo'], full_res['modeled_on_hi'], max_on),
+        ('WASH', curves_wash, full_res['modeled_wash'],
+         full_res['modeled_wash_lo'], full_res['modeled_wash_hi'], max_wash),
+    ]:
+        lo = np.quantile(curves, 0.025, axis=0)
+        hi = np.quantile(curves, 0.975, axis=0)
+        mean = curves.mean(axis=0)
+        sd = curves.std(axis=0, ddof=1)
+        for i in range(max_d + 1):
+            curve_rows.append({
+                'component': comp, 'duration': i,
+                'point_estimate': float(point[i]),
+                'analytical_lo': float(alo[i]), 'analytical_hi': float(ahi[i]),
+                'boot_mean': float(mean[i]), 'boot_sd': float(sd[i]),
+                'boot_lo_2p5': float(lo[i]), 'boot_hi_97p5': float(hi[i]),
+            })
+
+    summary = {
+        'point': float(full_res['est_RD']),
+        'analytical_SE': float(full_res['se_rd']),
+        'bootstrap_SE': float(rds.std(ddof=1)),
+        'bootstrap_mean': float(rds.mean()),
+        'bootstrap_lo_2p5': float(np.quantile(rds, 0.025)),
+        'bootstrap_hi_97p5': float(np.quantile(rds, 0.975)),
+        'B_total': B,
+        'B_converged': len(ok_results),
+    }
+    if verbose:
+        print(f"  [BOOT] RD = {summary['point']:.5f}, boot SE = {summary['bootstrap_SE']:.5f}, "
+              f"95% percentile CI = ({summary['bootstrap_lo_2p5']:.5f}, "
+              f"{summary['bootstrap_hi_97p5']:.5f})", flush=True)
+        print(f"  [BOOT] Total runtime {(time.time()-t0)/60:.1f} min", flush=True)
+
+    return {'summary': summary, 'curve_bands': pd.DataFrame(curve_rows),
+            'rd_draws': rds}
+
+
 # Figures
 def plot_figure4(tte_result, snmm_result, T_val=T, grace_len=GRACE,
                  save_path=None):
@@ -1223,11 +1373,26 @@ def plot_figure4(tte_result, snmm_result, T_val=T, grace_len=GRACE,
     plt.close(fig)
 
 
-def plot_figure5(snmm_result, T_val=T, save_path=None):
+def plot_figure5(snmm_result, T_val=T, save_path=None, boot=None):
     """Figure 5 duration curves."""
     if snmm_result.get('modeled_on') is None:
         print("  Cannot plot Figure 5: SNMM failed")
         return
+
+    on_lo = snmm_result.get('modeled_on_lo')
+    on_hi = snmm_result.get('modeled_on_hi')
+    wash_lo = snmm_result.get('modeled_wash_lo')
+    wash_hi = snmm_result.get('modeled_wash_hi')
+    band_label = '95% CI'
+    ci_note = 'analytical 95% CIs'
+    if boot is not None:
+        bands = boot['curve_bands']
+        on_b = bands[bands['component'] == 'ON'].sort_values('duration')
+        wash_b = bands[bands['component'] == 'WASH'].sort_values('duration')
+        on_lo, on_hi = on_b['boot_lo_2p5'].values, on_b['boot_hi_97p5'].values
+        wash_lo, wash_hi = wash_b['boot_lo_2p5'].values, wash_b['boot_hi_97p5'].values
+        band_label = '95% bootstrap percentile CI'
+        ci_note = 'cluster-bootstrap percentile 95% CIs'
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
     x = np.arange(0, T_val + 1)
@@ -1235,15 +1400,8 @@ def plot_figure5(snmm_result, T_val=T, save_path=None):
     knots_wash = snmm_result.get('knots_wash', np.array([]))
 
     ax = axes[0]
-    if snmm_result.get('modeled_on_lo') is not None:
-        ax.fill_between(
-            x,
-            snmm_result['modeled_on_lo'],
-            snmm_result['modeled_on_hi'],
-            color='C0',
-            alpha=0.20,
-            label='95% CI'
-        )
+    if on_lo is not None:
+        ax.fill_between(x, on_lo, on_hi, color='C0', alpha=0.20, label=band_label)
     ax.plot(x, snmm_result['modeled_on'], 'C0-', lw=2.0, label='SNMM estimate')
     ax.axhline(0, color='k', lw=0.8)
     for k in knots_on:
@@ -1256,15 +1414,8 @@ def plot_figure5(snmm_result, T_val=T, save_path=None):
     ax.grid(alpha=0.3)
 
     ax = axes[1]
-    if snmm_result.get('modeled_wash_lo') is not None:
-        ax.fill_between(
-            x,
-            snmm_result['modeled_wash_lo'],
-            snmm_result['modeled_wash_hi'],
-            color='C1',
-            alpha=0.20,
-            label='95% CI'
-        )
+    if wash_lo is not None:
+        ax.fill_between(x, wash_lo, wash_hi, color='C1', alpha=0.20, label=band_label)
     ax.plot(x, snmm_result['modeled_wash'], 'C1-', lw=2.0, label='SNMM estimate')
     ax.axhline(0, color='k', lw=0.8)
     for k in knots_wash:
@@ -1277,7 +1428,7 @@ def plot_figure5(snmm_result, T_val=T, save_path=None):
 
     fig.suptitle(
         'Figure 5: SNMM-Estimated Dynamic Treatment Effects\n'
-        '(Tirzepatide vs SGLT2, analytical 95% CIs)',
+        f'(Tirzepatide vs SGLT2, {ci_note})',
         fontsize=13, y=1.04)
     fig.tight_layout()
     if save_path:
@@ -1374,7 +1525,7 @@ def plot_duration_support(snmm_result, T_val=T, save_path=None):
     plt.close(fig)
 
 
-def build_results_table(tte_result, snmm_result):
+def build_results_table(tte_result, snmm_result, boot=None):
     """Table 4 results."""
     rows = []
     rd_tte = tte_result.get('est_RD', np.nan)
@@ -1386,6 +1537,7 @@ def build_results_table(tte_result, snmm_result):
         'SE': f'{se_tte:.4f}' if not np.isnan(se_tte) else '-',
         '95% CI': f'({rd_tte-1.96*se_tte:.4f}, {rd_tte+1.96*se_tte:.4f})'
             if not np.isnan(rd_tte) and not np.isnan(se_tte) else '-',
+        'CI basis': 'analytical',
         'J-stat': '-', 'J p-value': '-', 'Z definition': z_def
     })
 
@@ -1393,12 +1545,22 @@ def build_results_table(tte_result, snmm_result):
     se_snmm = snmm_result.get('se_rd', np.nan)
     j_stat = snmm_result.get('J_stat', np.nan)
     j_pval = snmm_result.get('J_pval', np.nan)
+    if boot is not None:
+        s = boot['summary']
+        ci_snmm = f"({s['bootstrap_lo_2p5']:.4f}, {s['bootstrap_hi_97p5']:.4f})"
+        se_str = f"{s['bootstrap_SE']:.4f}"
+        ci_basis = f"cluster-bootstrap percentile ({s['B_converged']}/{s['B_total']} converged)"
+    else:
+        ci_snmm = (f'({rd_snmm-1.96*se_snmm:.4f}, {rd_snmm+1.96*se_snmm:.4f})'
+                   if not np.isnan(rd_snmm) and not np.isnan(se_snmm) else '-')
+        se_str = f'{se_snmm:.4f}' if not np.isnan(se_snmm) else '-'
+        ci_basis = 'analytical'
     rows.append({
         'Estimator': 'SNMM (g-estimation)',
         'RD': f'{rd_snmm:.4f}' if not np.isnan(rd_snmm) else '-',
-        'SE': f'{se_snmm:.4f}' if not np.isnan(se_snmm) else '-',
-        '95% CI': f'({rd_snmm-1.96*se_snmm:.4f}, {rd_snmm+1.96*se_snmm:.4f})'
-            if not np.isnan(rd_snmm) and not np.isnan(se_snmm) else '-',
+        'SE': se_str,
+        '95% CI': ci_snmm,
+        'CI basis': ci_basis,
         'J-stat': f'{j_stat:.3f}' if not np.isnan(j_stat) else '-',
         'J p-value': f'{j_pval:.4f}' if not np.isnan(j_pval) else '-',
         'Z definition': z_def
@@ -1413,7 +1575,7 @@ def build_results_table(tte_result, snmm_result):
                 'Estimator': f'  ON spline coef {i+1}',
                 'RD': f'{beta[i]:.4f}', 'SE': f'{se_b[i]:.4f}',
                 '95% CI': f'({beta[i]-1.96*se_b[i]:.4f}, {beta[i]+1.96*se_b[i]:.4f})',
-                'J-stat': '', 'J p-value': '', 'Z definition': ''
+                'CI basis': 'analytical', 'J-stat': '', 'J p-value': '', 'Z definition': ''
             })
         p_wash = snmm_result.get('p_wash', 0)
         for i in range(p_wash):
@@ -1422,7 +1584,7 @@ def build_results_table(tte_result, snmm_result):
                 'Estimator': f'  WASH spline coef {i+1}',
                 'RD': f'{beta[idx]:.4f}', 'SE': f'{se_b[idx]:.4f}',
                 '95% CI': f'({beta[idx]-1.96*se_b[idx]:.4f}, {beta[idx]+1.96*se_b[idx]:.4f})',
-                'J-stat': '', 'J p-value': '', 'Z definition': ''
+                'CI basis': 'analytical', 'J-stat': '', 'J p-value': '', 'Z definition': ''
             })
         p_switch = snmm_result.get('p_switch', 0)
         if p_switch:
@@ -1431,7 +1593,7 @@ def build_results_table(tte_result, snmm_result):
                 'Estimator': '  SGLT2 with/after TZP state coef',
                 'RD': f'{beta[idx]:.4f}', 'SE': f'{se_b[idx]:.4f}',
                 '95% CI': f'({beta[idx]-1.96*se_b[idx]:.4f}, {beta[idx]+1.96*se_b[idx]:.4f})',
-                'J-stat': '', 'J p-value': '', 'Z definition': ''
+                'CI basis': 'analytical', 'J-stat': '', 'J p-value': '', 'Z definition': ''
             })
 
     return pd.DataFrame(rows)
@@ -1466,11 +1628,25 @@ if __name__ == '__main__':
         df, grace_len=GRACE, trunc=TRUNC, censor_col='C_ltfu',
         verbose=True)
 
+    print(f"\n--- Cluster bootstrap (B={B_BOOT}) ---")
+    boot_result = run_cluster_bootstrap(
+        df, snmm_result, B=B_BOOT, seed=SEED, n_jobs=-1,
+        checkpoint_path=os.path.join(BASE_OUTDIR,
+                                     'Tirzepatide_Duration_Bootstrap_Checkpoint.pkl'),
+        verbose=True)
+
+    boot_result['curve_bands'].to_csv(
+        os.path.join(BASE_OUTDIR, 'Tirzepatide_Duration_Response_Bootstrap.csv'),
+        index=False)
+    pd.DataFrame([dict(estimate='SNMM RD (18-month)', **boot_result['summary'])]).to_csv(
+        os.path.join(BASE_OUTDIR, 'Tirzepatide_RD_Bootstrap_Summary.csv'),
+        index=False)
+
     print("\n" + "=" * 70)
     print("RESULTS")
     print("=" * 70)
 
-    table4 = build_results_table(tte_result, snmm_result)
+    table4 = build_results_table(tte_result, snmm_result, boot=boot_result)
     table4.to_csv(os.path.join(BASE_OUTDIR, 'Table4_Tirzepatide_OUD_Results.csv'),
                   index=False)
     print("\nTable 4: Tirzepatide / OUD Application Results")
@@ -1535,7 +1711,7 @@ if __name__ == '__main__':
         save_path=os.path.join(BASE_OUTDIR,
                                'Figure4_Tirzepatide_ITT_Cumulative_Incidence.png'))
     plot_figure5(
-        snmm_result, T_val=T,
+        snmm_result, T_val=T, boot=boot_result,
         save_path=os.path.join(BASE_OUTDIR,
                                'Figure5_Tirzepatide_Duration_Effects.png'))
     plot_duration_support(

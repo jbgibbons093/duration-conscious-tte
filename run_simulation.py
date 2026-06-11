@@ -375,6 +375,17 @@ def _gmm_jacobian(moment_fn, beta, eps=1e-5):
     return D
 
 
+def _cluster_omega(G, groups, ridge=1e-8):
+    """Cluster-robust moment covariance for the step-2 weight matrix and J."""
+    G = np.asarray(G, dtype=float)
+    groups = np.asarray(groups)
+    uniq, inv = np.unique(groups, return_inverse=True)
+    sums = np.zeros((len(uniq), G.shape[1]), dtype=float)
+    np.add.at(sums, inv, G)
+    Omega = (sums.T @ sums) / G.shape[0]
+    return Omega + ridge * np.eye(G.shape[1])
+
+
 def _cluster_gmm_cov(moment_fn, beta_hat, W_opt, groups):
     """Clustered GMM sandwich variance."""
     D = _gmm_jacobian(moment_fn, beta_hat)
@@ -1002,7 +1013,8 @@ def run_snmm_g(df, grace_len=3, trunc=TRUNC,
         sol1g = minimize(_gamma_objective, gamma0, args=(W1g,), method='L-BFGS-B',
                          options=dict(maxiter=500, ftol=1e-12))
         G1g = _restart_moment_matrix(sol1g.x)
-        Omega_g = (G1g.T @ G1g) / G1g.shape[0]
+        groups_g = analysis["id"].to_numpy()[post_grace]
+        Omega_g = _cluster_omega(G1g, groups_g)
         try:
             W_opt_g = np.linalg.inv(Omega_g)
         except np.linalg.LinAlgError:
@@ -1075,7 +1087,8 @@ def run_snmm_g(df, grace_len=3, trunc=TRUNC,
                         options=dict(maxiter=500, ftol=1e-12))
 
         G1 = moment_matrix(sol1.x)
-        Omega = (G1.T @ G1) / G1.shape[0]
+        groups_pg = analysis["id"].to_numpy()[post_grace]
+        Omega = _cluster_omega(G1, groups_pg)
         try:
             W_opt = np.linalg.inv(Omega)
         except np.linalg.LinAlgError:
@@ -1106,7 +1119,6 @@ def run_snmm_g(df, grace_len=3, trunc=TRUNC,
     se_beta = np.full(p, np.nan) if p > 0 else np.array([])
     if p > 0:
         try:
-            groups_pg = analysis["id"].to_numpy()[post_grace]
             V_beta = _cluster_gmm_cov(moment_matrix, beta_hat, W_opt, groups_pg)
             se_beta = np.sqrt(np.diag(V_beta))
         except Exception:
@@ -1353,7 +1365,7 @@ def _fast_snmm_bootstrap_rd(df, snmm_res, grace_len, trunc, b_boot, seed):
             sol1 = minimize(_obj_b, beta0, args=(W1,), method='L-BFGS-B',
                            options=dict(maxiter=300, ftol=1e-10))
             G1 = _moments_b(sol1.x)
-            Omega = (G1.T @ G1) / G1.shape[0]
+            Omega = _cluster_omega(G1, analysis["id"].to_numpy()[post_grace])
             try:
                 W_opt = np.linalg.inv(Omega)
             except np.linalg.LinAlgError:
@@ -2895,6 +2907,11 @@ if __name__ == "__main__":
              "N": N, "conf_strength": CONF_STRENGTH,
              "dyn_on1": -0.33, "dyn_on2": -0.15,
              "dyn_off1": 0.27, "dyn_off2": 0.15},
+            {"label": "No treatment effect",
+             "N": N, "conf_strength": CONF_STRENGTH,
+             "beta_A_to_Y": 0.0,
+             "dyn_on1": 0.0, "dyn_on2": 0.0,
+             "dyn_off1": 0.0, "dyn_off2": 0.0},
         ]
         try:
             scenario_results = run_scenario_sensitivity(
