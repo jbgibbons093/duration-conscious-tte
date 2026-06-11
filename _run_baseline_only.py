@@ -1,12 +1,8 @@
-"""Baseline-only MC re-run (skips the scenario grid).
-Regenerates Table 1, Table 2, Table 3 (baseline-only), Figures 1-3, and
-MC_Raw_Results using the edited simdtte 9.py (cluster sandwich, bootstrap-
-headline coverage, bias-variance decomposition). Baseline keeps the full
-B_MC_BOOT inner bootstrap. Writes a compact summary to _baseline_summary.txt."""
+"""Baseline-only Monte Carlo run."""
 import os, importlib.util, numpy as np
 
 HERE = os.getcwd()
-spec = importlib.util.spec_from_file_location('sdt', os.path.join(HERE, 'simdtte 9.py'))
+spec = importlib.util.spec_from_file_location('sdt', os.path.join(HERE, 'run_simulation.py'))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 BASE, APP = m.BASE_OUTDIR, m.APPENDIX_OUTDIR
 
@@ -16,19 +12,16 @@ df, draws, dgp = m.simulate_trial_data(N=m.N, T=m.T, grace_len=m.GRACE,
 true_rd, _, _ = m.compute_true_itt(draws, dgp)
 print(f"[BASELINE] True ITT RD = {true_rd:.4f}", flush=True)
 
-# Table 1 (DGP summary)
 m.build_table_1_dgp_summary(df, draws, dgp).to_csv(
     os.path.join(BASE, "Table1_DGP_Summary.csv"), index=False)
 print("[CHECKPOINT] Table 1 written.", flush=True)
 
-# Baseline Monte Carlo
 print("[CHECKPOINT] Starting baseline MC...", flush=True)
 mc = m.run_monte_carlo(M=m.M_SIMS, N=m.N, T=m.T, grace_len=m.GRACE,
                        conf_strength=m.CONF_STRENGTH, base_seed=m.SEED,
                        n_jobs=-1, verbose=True)
 print(f"[CHECKPOINT] Baseline MC done: {len(mc['results_df'])} reps.", flush=True)
 
-# Figures 1-3
 m.plot_figure1_mc(mc["mc_curves"], T_val=m.T, grace_len=m.GRACE,
                   save_path=os.path.join(BASE, "Figure1_ITT_Cumulative_Incidence.png"))
 m.plot_figure2_mc(mc["mc_dyn"], dgp, max_dur=m.T,
@@ -36,7 +29,6 @@ m.plot_figure2_mc(mc["mc_dyn"], dgp, max_dur=m.T,
 m.plot_figure3_mc(mc, save_path=os.path.join(BASE, "Figure3_Final_RiskDifference.png"))
 print("[CHECKPOINT] Figures 1-3 written.", flush=True)
 
-# Table 2 and Table 3 (baseline only: scenario_results=None)
 t2 = m.build_table_2_mc_performance(mc["summary"], mc_result_df=mc["results_df"])
 t2.to_csv(os.path.join(BASE, "Table2_Estimator_Performance.csv"), index=False)
 m.build_table_3_mc_performance(mc, None).to_csv(

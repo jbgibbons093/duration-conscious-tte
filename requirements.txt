@@ -1,0 +1,7 @@
+numpy
+pandas
+statsmodels
+matplotlib
+scipy
+joblib
+python-calamine

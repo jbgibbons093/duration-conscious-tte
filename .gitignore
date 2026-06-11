@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+env/
+
+raw data/
+appendix/
+
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.docx
+
+_baseline_summary.txt
